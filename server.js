@@ -2,30 +2,79 @@ const express = require('express');
 const app = express();
 app.use(express.json());
 
-// ❌ BUG 1: Global state leaks memory & rate-limit state across all users
-const requestCounts = {};
+/** --------------------------------------------------------------------
+ *  In‑memory sliding‑window rate limiter
+ *  - max 2 requests per user per 60 000 ms (1 min) window
+ *  - automatically resets counters after the window expires
+ *  - periodic cleanup removes stale entries
+ * ------------------------------------------------------------------- */
+const rateLimiter = (() => {
+    const MAX_REQUESTS = 2;
+    const WINDOW_MS = 60_000; // 1 minute
+    // Map<userId, { count: number, resetAt: number }>
+    const store = new Map();
 
-// ❌ BUG 2: Synchronous block without async error boundary or cleanup
-app.post('/api/ai-completion', (req, res) => {
+    return {
+        /** Returns true if the request is allowed, false otherwise. */
+        isAllowed(userId) {
+            const now = Date.now();
+            const entry = store.get(userId);
+
+            if (!entry || now > entry.resetAt) {
+                // First request for this user or window has expired → start fresh
+                store.set(userId, { count: 1, resetAt: now + WINDOW_MS });
+                return true;
+            }
+
+            if (entry.count < MAX_REQUESTS) {
+                entry.count += 1;
+                return true;
+            }
+
+            // Over the limit
+            return false;
+        },
+
+        /** Remove entries whose windows have passed – prevents unbounded growth. */
+        cleanup() {
+            const now = Date.now();
+            for (const [key, { resetAt }] of store.entries()) {
+                if (now > resetAt) store.delete(key);
+            }
+        },
+    };
+})();
+
+// Run cleanup every 5 minutes
+setInterval(() => rateLimiter.cleanup(), 5 * 60 * 1000);
+
+async function someAsyncProcessing(prompt) {
+    // Simulate async work (replace with real processing as needed)
+    return prompt;
+}
+
+app.post('/api/ai-completion', async (req, res) => {
     const userId = req.headers['x-user-id'] || 'anonymous';
-    
-    // Increment request count
-    requestCounts[userId] = (requestCounts[userId] || 0) + 1;
-
-    // Rate-limit check: Limit users to 2 requests
-    if (requestCounts[userId] > 2) {
-        // ❌ BUG 3: Returns response without halting execution or resetting headers
-        res.status(429).json({ error: "Rate limit exceeded" });
-    }
-
-    // Heavy simulated payload processing
     const { prompt } = req.body;
+
     if (!prompt) {
         return res.status(400).json({ error: "Prompt is required" });
     }
 
-    // Logic error: headers sent twice if rate-limited above!
-    res.status(200).json({ response: `Processed: ${prompt}` });
+    // ---------- Rate‑limit check ----------
+    if (!rateLimiter.isAllowed(userId)) {
+        // IMPORTANT: `return` stops further execution and prevents double‑send
+        return res.status(429).json({ error: "Rate limit exceeded" });
+    }
+
+    // ---------- Normal processing ----------
+    try {
+        const result = await someAsyncProcessing(prompt);
+        return res.status(200).json({ response: `Processed: ${result}` });
+    } catch (err) {
+        console.error('Processing error:', err);
+        return res.status(500).json({ error: 'Internal server error' });
+    }
 });
 
 module.exports = app;
